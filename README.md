@@ -234,6 +234,81 @@ npm run build
    - 缺点：部分资源需要会员
 
 
+## 技术实现：MissAV 与 Jable 下载流程
+
+本项目对 MissAV 与 Jable 的下载实现采用“策略模式 + 统一下载管道”。核心思路是：
+- 用不同的 Downloader 实现负责“找出可用的 m3u8 播放列表（HLS）链接”。
+- 找到 m3u8 后，统一用外部下载器将 HLS 拉取为 TS，再用 ffmpeg 无损转封装为 MP4。
+- 元数据（标题、演员、封面等）与下载解耦，统一从 JavBus 抓取，生成 NFO 和封面图。
+
+关键技术点：
+- HTTP 抓取：使用 curl_cffi.requests 并设置 impersonate="chrome110" 和常见浏览器 UA/Referer 头，绕过部分站点的反爬/风控。
+- 代理与回退：可配置代理，下载失败会在“使用/不使用代理”之间回退重试。
+- HLS 解析：对 m3u8 主清单解析，优先选择最高码率/分辨率的分流。
+- 视频下载：内置 tools/m3u8-Downloader-Go（二进制）负责 HLS 下载；然后 ffmpeg 进行容器转换（TS -> MP4）。
+- 任务编排：按 cfg/configs.json 中 Downloader 的权重顺序尝试，直至成功。
+
+总体流程（入口 main.py）：
+1) 初始化去重数据库（SQLite）、读取配置、文件锁避免并发下载。
+2) 根据权重，从 DownloaderMgr 依次取出下载器并设置域名。
+3) 对目标番号调用 downloader.downloadInfo(avid)：
+   - 构造详情页 URL 并抓取 HTML（downloader.getHTML）。
+   - 从 HTML 中解析出 m3u8 和基本信息（downloader.parseHTML）。
+   - 将 download_info.json 与原始 HTML 落盘便于调试。
+4) 调用 downloader.downloadM3u8(m3u8, avid)：
+   - 使用 m3u8-Downloader-Go 把 HLS 下载为 TS。
+   - 用 ffmpeg 无损转封装为 MP4，并删除中间 TS。
+5) 下载成功后，仅进行一次元数据刮削（JavBus），生成 NFO、封面与演员图。
+
+MissAV 的实现细节（src/downloader/missAVDownloader.py）：
+- URL 构造（多路回退）：
+  - https://{domain}/cn/{avid}-uncensored-leak
+  - https://{domain}/cn/{avid}-chinese-subtitle
+  - https://{domain}/cn/{avid}
+  - https://{domain}/dm13/cn/{avid}
+  逐个尝试抓取，直到获得有效 HTML。
+- m3u8 提取：
+  - 在 HTML 中匹配形如 "m3u8|...|com|surrit|https|video" 的片段，
+    通过 _extract_uuid 还原 UUID，拼出主清单 https://surrit.com/{uuid}/playlist.m3u8。
+  - 请求主清单后，解析 #EXT-X-STREAM-INF 行，按带宽降序选择最高清晰度流（_get_highest_quality_m3u8）。
+- 基本信息：
+  - 通过 og:title 提取标题，并从中分离番号（如 ABC-123）。
+
+Jable 的实现细节（src/downloader/jableDownloder.py）：
+- 详情页 URL： https://{domain}/videos/{avid}/
+- 直接在 HTML 中用正则提取 var hlsUrl = '...'; 即为 m3u8 播放地址。
+- 同样通过 og:title 提取标题并分离番号。
+
+统一下载实现（src/downloader/downloaderBase.py）：
+- downloadInfo(avid)：
+  - getHTML 抓取详情页 HTML；
+  - parseHTML 解析出 AVDownloadInfo(m3u8/avid/title)；
+  - 将 html 与 download_info.json 保存至 SavePath/AVID/。
+- downloadM3u8(url, avid)：
+  - 根据 IsNeedVideoProxy 与 Proxy 配置选择是否带代理调用 tools/m3u8-Downloader-Go；
+  - 下载为 AVID.ts 后，执行 ffmpeg -i AVID.ts -c copy -f mp4 AVID.mp4；
+  - 删除中间 TS 文件。
+- HTTP 抓取细节：
+  - curl_cffi.requests.get(..., impersonate="chrome110", proxies=..., headers=...)
+
+元数据与 NFO（src/scraper.py；与下载解耦）：
+- 统一从 JavBus 抓取标题、演员、时长、发行日期、封面、样品图等。
+- 下载图像时带上 Referer，使用 Pillow 将横版封面裁剪为竖版 poster。
+- 生成 Jellyfin/Kodi 兼容的 NFO（ElementTree + minidom）。
+
+配置与权重（cfg/configs.json）：
+- Downloader 数组按 weight 降序；域名通过 domain 配置。
+- Proxy、IsNeedVideoProxy 控制代理行为。
+
+防爬与稳定性：
+- 使用浏览器指纹模拟（impersonate）、合理请求头与 Referer。
+- 失败回退：
+  - MissAV 多路径详情页回退；
+  - Jable 若提取失败会切换下一个下载器；
+  - 下载阶段在“使用/不使用代理”之间回退重试。
+
+以上实现保证了 MissAV 与 Jable 在不同网络环境与反爬策略下有较高的成功率与可维护性。
+
 ## 开发指南
 
 ### 添加新的下载器
